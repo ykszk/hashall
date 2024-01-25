@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use digest::Digest;
+use digest::{Digest, FixedOutputReset};
 use log::debug;
 use md5::Md5;
 use std::fs::read_dir;
@@ -12,7 +12,8 @@ use std::{
 
 #[derive(Debug, Clone, clap::ValueEnum)]
 enum Algorithm {
-    MD5,
+    Md5,
+    Sha1,
 }
 
 #[derive(Parser, Debug)]
@@ -63,94 +64,221 @@ fn escaped_display(path: &Path) -> String {
     escape_csv(&path.display().to_string())
 }
 
-fn stream_digest(path: &Path, buffer_size: usize, print_format: PrintFormat) -> Result<()>
-where
-{
-    let mut file = File::open(path)?;
-    let mut buffer = vec![0; buffer_size];
-    let mut digest = Md5::new();
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        digest.update(&buffer[..n]);
-    }
-    let hash = digest.finalize_reset();
-    match print_format {
-        PrintFormat::Sum => {
-            println!("{:x}  {}", hash, path.display());
-        }
-        PrintFormat::Csv => {
-            println!("{:x},{}", hash, escaped_display(path));
-        }
-    }
-    Ok(())
+// fn read_digest<R: Read, H: Digest + FixedOutputReset>(
+//     hasher: &mut H,
+//     mut read: R,
+//     buffer: &mut [u8],
+// ) -> Result<digest::Output<H>> {
+//     loop {
+//         let n = read.read(buffer)?;
+//         if n == 0 {
+//             break;
+//         }
+//         Digest::update(hasher, &buffer[..n]);
+//     }
+//     let hash = hasher.finalize_reset();
+//     Ok(hash)
+// }
+
+struct BufHash<H: Digest + FixedOutputReset> {
+    hasher: H,
+    hash: digest::Output<H>,
+    format: PrintFormat,
+    buffer: Vec<u8>,
 }
 
-fn process_zip(path: &Path, buffer_size: usize, print_format: PrintFormat) -> Result<()> {
-    let file = File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-    let mut digest = Md5::new();
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        if file.is_dir() {
-            continue;
+impl<H> BufHash<H>
+where
+    H: Digest + FixedOutputReset,
+    <H as digest::OutputSizeUser>::OutputSize: std::ops::Add,
+    <<H as digest::OutputSizeUser>::OutputSize as std::ops::Add>::Output:
+        digest::generic_array::ArrayLength<u8>,
+{
+    fn new(buffer_size: usize, format: PrintFormat) -> Self {
+        let hasher = H::new();
+        let hash = Default::default();
+        let buffer = vec![0; buffer_size];
+        BufHash {
+            hasher,
+            hash,
+            format,
+            buffer,
         }
-        let mut buffer = vec![0; buffer_size];
+    }
+
+    // fn digest<R: Read>(&self, path: &Path, mut readable: R) -> Result<()> {
+    //     loop {
+    //         let n = readable.read(&mut self.buffer)?;
+    //         if n == 0 {
+    //             break;
+    //         }
+    //         Digest::update(&mut self.hasher, &self.buffer[..n]);
+    //     }
+    //     digest::FixedOutputReset::finalize_into_reset(&mut self.hasher, &mut self.hash);
+    //     match self.format {
+    //         PrintFormat::Sum => {
+    //             println!("{:x}  {}", self.hash, path.display());
+    //         }
+    //         PrintFormat::Csv => {
+    //             println!("{:x},{}", self.hash, escaped_display(path));
+    //         }
+    //     }
+    //     Ok(())
+    // }
+
+    fn digest_file(&mut self, path: &Path) -> Result<()> {
+        // let mut file = File::open(path)?;
+        // self.digest(path, file)
+        let mut file = File::open(path)?;
         loop {
-            let n = file.read(&mut buffer)?;
+            let n = file.read(&mut self.buffer)?;
             if n == 0 {
                 break;
             }
-            digest.update(&buffer[..n]);
+            Digest::update(&mut self.hasher, &self.buffer[..n]);
         }
-        let hash = digest.finalize_reset();
-        match print_format {
+        digest::FixedOutputReset::finalize_into_reset(&mut self.hasher, &mut self.hash);
+        match self.format {
             PrintFormat::Sum => {
-                println!("{:x}  {}/{}", hash, path.display(), file.name());
+                println!("{:x}  {}", self.hash, path.display());
             }
             PrintFormat::Csv => {
-                println!("{:x},{}", hash, escaped_display(path));
+                println!("{:x},{}", self.hash, escaped_display(path));
             }
         }
+        Ok(())
     }
-    Ok(())
+    fn digest_zip(&mut self, path: &Path) -> Result<()> {
+        let file = File::open(path)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            if file.is_dir() {
+                continue;
+            }
+            loop {
+                let n = file.read(&mut self.buffer)?;
+                if n == 0 {
+                    break;
+                }
+                Digest::update(&mut self.hasher, &self.buffer[..n]);
+            }
+            digest::FixedOutputReset::finalize_into_reset(&mut self.hasher, &mut self.hash);
+            match self.format {
+                PrintFormat::Sum => {
+                    println!("{:x}  {}/{}", self.hash, path.display(), file.name());
+                }
+                PrintFormat::Csv => {
+                    println!("{:x},{}", self.hash, escaped_display(path));
+                }
+            }
+        }
+        Ok(())
+    }
+    // fn digest_zip_entry(&self, entry:)
 }
 
-fn process_input(
+// fn stream_digest<H>(
+//     hasher: BufHash<H>,
+//     path: &Path,
+//     buffer_size: usize,
+//     print_format: PrintFormat,
+// ) -> Result<()>
+// where
+//     H: Digest + FixedOutputReset,
+// {
+//     let file = File::open(path)?;
+//     let mut buffer = vec![0; buffer_size];
+//     let hasher = Md5::new();
+//     let hash = read_digest(hasher, file, buffer.as_mut_slice())?;
+//     match print_format {
+//         PrintFormat::Sum => {
+//             println!("{:x}  {}", hash, path.display());
+//         }
+//         PrintFormat::Csv => {
+//             println!("{:x},{}", hash, escaped_display(path));
+//         }
+//     }
+//     Ok(())
+// }
+
+// fn process_zip<H>(
+//     hasher: &BufHash<H>,
+//     path: &Path,
+//     buffer_size: usize,
+//     print_format: PrintFormat,
+// ) -> Result<()>
+// where
+//     H: Digest + FixedOutputReset,
+//     <H as digest::OutputSizeUser>::OutputSize: std::ops::Add,
+//     <<H as digest::OutputSizeUser>::OutputSize as std::ops::Add>::Output:
+//         digest::generic_array::ArrayLength<u8>,
+// {
+//     let file = File::open(path)?;
+//     let mut archive = zip::ZipArchive::new(file)?;
+//     let mut digest = Md5::new();
+//     for i in 0..archive.len() {
+//         let mut file = archive.by_index(i)?;
+//         if file.is_dir() {
+//             continue;
+//         }
+//         let mut buffer = vec![0; buffer_size];
+//         loop {
+//             let n = file.read(&mut buffer)?;
+//             if n == 0 {
+//                 break;
+//             }
+//             digest.update(&buffer[..n]);
+//         }
+//         let hash = digest.finalize_reset();
+//         match print_format {
+//             PrintFormat::Sum => {
+//                 println!("{:x}  {}/{}", hash, path.display(), file.name());
+//             }
+//             PrintFormat::Csv => {
+//                 println!("{:x},{}", hash, escaped_display(path));
+//             }
+//         }
+//     }
+//     Ok(())
+// }
+
+fn process_input<H>(
+    hasher: &mut BufHash<H>,
     input: &Path,
-    buffer_size: usize,
-    print_format: PrintFormat,
     recursive: bool,
     archive: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    H: Digest + FixedOutputReset,
+    <H as digest::OutputSizeUser>::OutputSize: std::ops::Add,
+    <<H as digest::OutputSizeUser>::OutputSize as std::ops::Add>::Output:
+        digest::generic_array::ArrayLength<u8>,
+{
     debug!("process_input: {}", input.display());
     if input.is_file() {
         if archive && input.extension().unwrap_or_default() == "zip" {
-            process_zip(input, buffer_size, print_format)?;
+            // process_zip(&hasher, input, buffer_size, print_format)?;
+            hasher.digest_zip(input)?;
         } else {
-            stream_digest(input, buffer_size, print_format)?;
+            hasher.digest_file(input)?;
         }
     } else if input.is_dir() && recursive {
         for entry in read_dir(input)? {
             let entry = entry?;
-            process_input(
-                entry.path().as_path(),
-                buffer_size,
-                print_format,
-                recursive,
-                archive,
-            )?;
+            process_input(hasher, entry.path().as_path(), recursive, archive)?;
         }
     }
     Ok(())
 }
 
-fn main() -> Result<()> {
-    env_logger::init();
-    let args = Args::parse();
-
+fn execute<H>(args: Args) -> Result<()>
+where
+    H: Digest + FixedOutputReset,
+    <H as digest::OutputSizeUser>::OutputSize: std::ops::Add,
+    <<H as digest::OutputSizeUser>::OutputSize as std::ops::Add>::Output:
+        digest::generic_array::ArrayLength<u8>,
+{
     let buffer_size: usize = parse_size::parse_size(&args.buffer).map_err(|e| {
         anyhow::anyhow!(
             "Failed to parse buffer size: {} (example: 1M, 1MiB, 1MB, 1Mib, 1m, 1, ...)",
@@ -161,22 +289,16 @@ fn main() -> Result<()> {
     if args.format == PrintFormat::Csv {
         println!("hash,filename");
     }
+    let mut hasher = BufHash::<H>::new(buffer_size, args.format);
     for input in args.input {
         if input.is_file() {
-            process_input(
-                &input,
-                buffer_size,
-                args.format,
-                args.recursive,
-                args.archive,
-            )?;
+            process_input(&mut hasher, &input, args.recursive, args.archive)?;
         } else if input.is_dir() {
             for entry in read_dir(&input)? {
                 let entry = entry?;
                 process_input(
+                    &mut hasher,
                     entry.path().as_path(),
-                    buffer_size,
-                    args.format,
                     args.recursive,
                     args.archive,
                 )?;
@@ -184,4 +306,39 @@ fn main() -> Result<()> {
         };
     }
     Ok(())
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+    let args = Args::parse();
+
+    match args.hash {
+        Algorithm::Md5 => execute::<Md5>(args),
+        Algorithm::Sha1 => execute::<sha1::Sha1>(args),
+    }
+
+    // let hasher: Box<dyn Hasher> = Box::new(BufHash::new(buffer_size));
+    // for input in args.input {
+    //     if input.is_file() {
+    //         process_input(
+    //             &input,
+    //             buffer_size,
+    //             args.format,
+    //             args.recursive,
+    //             args.archive,
+    //         )?;
+    //     } else if input.is_dir() {
+    //         for entry in read_dir(&input)? {
+    //             let entry = entry?;
+    //             process_input(
+    //                 entry.path().as_path(),
+    //                 buffer_size,
+    //                 args.format,
+    //                 args.recursive,
+    //                 args.archive,
+    //             )?;
+    //         }
+    //     };
+    // }
+    // Ok(())
 }

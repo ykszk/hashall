@@ -310,6 +310,7 @@ dependencies = [
  "log",
  "md-5",
  "parse-size",
+ "sha1",
  "zip",
 ]
 
