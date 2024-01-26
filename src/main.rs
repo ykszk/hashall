@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::Parser;
 use digest::{Digest, FixedOutputReset};
 use log::debug;
-use md5::Md5;
 use std::fs::read_dir;
 use std::{
     fs::File,
@@ -27,6 +26,10 @@ struct Args {
     #[arg(long, default_value = "md5")]
     hash: Algorithm,
 
+    /// All files including hidden files
+    #[arg(short, long)]
+    all: bool,
+
     /// Recursive search
     #[arg(short, long)]
     recursive: bool,
@@ -35,8 +38,8 @@ struct Args {
     #[arg(short, long, default_value = "1M")]
     buffer: String,
 
-    /// Hash files in archive files (zip)
-    #[arg(short, long)]
+    /// Hash files in archive (only zip atm) files
+    #[arg(long)]
     archive: bool,
 
     /// Output format
@@ -46,6 +49,23 @@ struct Args {
     /// Number of jobs. 0 means number of logical cores.
     #[arg(short, long, default_value = "0")]
     jobs: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Flags {
+    all: bool,
+    recursive: bool,
+    archive: bool,
+}
+
+impl From<&Args> for Flags {
+    fn from(args: &Args) -> Self {
+        Flags {
+            all: args.all,
+            recursive: args.recursive,
+            archive: args.archive,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -104,7 +124,7 @@ where
         }
         digest::FixedOutputReset::finalize_into_reset(&mut self.hasher, &mut self.hash);
 
-        // `println!` locks stdout
+        // No need for manual locking because println! locks stdout.
         match self.format {
             PrintFormat::Sum => {
                 println!("{:x}  {}", self.hash, path.display());
@@ -130,30 +150,34 @@ where
             if file.is_dir() {
                 continue;
             }
-            self._digest_print(path, &mut file)?;
+            let zip_path = path.join(file.name());
+            self._digest_print(zip_path.as_path(), &mut file)?;
         }
         Ok(())
     }
 }
 
-fn list_entries<H>(input: &Path, recursive: bool, archive: bool) -> Result<Option<Entry>>
+fn is_dotfile(path: &Path) -> bool {
+    path.file_name().unwrap().to_str().unwrap().starts_with('.')
+}
+
+fn list_entries<H>(input: PathBuf, flags: Flags) -> Result<Option<Entry>>
 where
     H: Digest + FixedOutputReset,
     <H as digest::OutputSizeUser>::OutputSize: std::ops::Add,
     <<H as digest::OutputSizeUser>::OutputSize as std::ops::Add>::Output:
         digest::generic_array::ArrayLength<u8>,
 {
+    if !flags.all && is_dotfile(&input) {
+        return Ok(None);
+    }
     if input.is_file() {
-        if archive && input.extension().unwrap_or_default() == "zip" {
-            return Ok(Some(Entry::Archive(vec![input.to_path_buf()])));
-        } else {
-            return Ok(Some(Entry::File(input.to_path_buf())));
-        }
-    } else if input.is_dir() && recursive {
+        return Ok(Some(Entry::File(input)));
+    } else if input.is_dir() && flags.recursive {
         let mut entries = Vec::new();
         for entry in read_dir(input)? {
             let entry = entry?;
-            if let Some(e) = list_entries::<H>(entry.path().as_path(), recursive, archive)? {
+            if let Some(e) = list_entries::<H>(entry.path(), flags)? {
                 entries.push(e);
             }
         }
@@ -166,23 +190,13 @@ where
 enum Entry {
     File(PathBuf),
     Dir(Vec<Entry>),
-    Archive(Vec<PathBuf>),
 }
 
 impl Entry {
-    // fn len(&self) -> usize {
-    //     match self {
-    //         Entry::File(_) => 1,
-    //         Entry::Dir(entries) => entries.iter().map(|e| e.len()).sum(),
-    //         Entry::Archive(_) => 1,
-    //     }
-    // }
-
     fn flatten(&self) -> Vec<&Path> {
         match self {
             Entry::File(path) => vec![path.as_path()],
             Entry::Dir(entries) => entries.iter().flat_map(|e| e.flatten()).collect(),
-            Entry::Archive(paths) => paths.iter().map(|p| p.as_path()).collect(),
         }
     }
 }
@@ -204,18 +218,21 @@ where
     if args.format == PrintFormat::Csv {
         println!("hash,filename");
     }
+    let flags = Flags::from(&args);
     debug!("list files");
     let mut all_entries = Vec::new();
     for input in args.input {
+        // list files regardless of all or recursive option
         let file_list = if input.is_file() {
-            list_entries::<H>(&input, args.recursive, args.archive)?
+            list_entries::<H>(input, flags)?
         } else if input.is_dir() {
             let mut entries = Vec::new();
             for entry in read_dir(&input)? {
                 let entry = entry?;
-                if let Some(e) =
-                    list_entries::<H>(entry.path().as_path(), args.recursive, args.archive)?
-                {
+                if !flags.all && is_dotfile(&entry.path()) {
+                    continue;
+                }
+                if let Some(e) = list_entries::<H>(entry.path(), flags)? {
                     entries.push(e);
                 }
             }
@@ -228,8 +245,8 @@ where
         }
     }
     let all_entries = Entry::Dir(all_entries);
-    let mut v_entries = all_entries.flatten();
-    debug!("entry count: {:?}", v_entries.len());
+    let mut path_list = all_entries.flatten();
+    debug!("entry count: {:?}", path_list.len());
     let n_jobs = if args.jobs == 0 {
         std::thread::available_parallelism()?.get()
     } else {
@@ -239,14 +256,14 @@ where
 
     std::thread::scope(|scope| {
         let mut handles: Vec<_> = Vec::with_capacity(n_jobs);
-        let chunk_size = (v_entries.len() as f64 / n_jobs as f64).ceil() as usize;
-        for chunk in v_entries.chunks_mut(chunk_size) {
+        let chunk_size = (path_list.len() as f64 / n_jobs as f64).ceil() as usize;
+        for chunk in path_list.chunks_mut(chunk_size) {
             handles.push(scope.spawn(|| {
                 let mut hasher = BufHash::<H>::new(buffer_size, args.format);
                 for entry in chunk {
                     match entry.extension().unwrap_or_default().to_str() {
                         Some("zip") => {
-                            if args.archive {
+                            if flags.archive {
                                 hasher.digest_zip(entry).unwrap();
                             } else {
                                 hasher.digest_file(entry).unwrap();
@@ -271,7 +288,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.hash {
-        Algorithm::Md5 => execute::<Md5>(args),
+        Algorithm::Md5 => execute::<md5::Md5>(args),
         Algorithm::Sha1 => execute::<sha1::Sha1>(args),
     }
 }

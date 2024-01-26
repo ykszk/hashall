@@ -3,7 +3,7 @@ A simple CLI tool to hash all files in a directory.
 
 Hash all files (including files inside archives) recursively:
 ```console
-hashall . -ar
+hashall . -r --archive
 ```
 
 Note: `--archive` only handles zip archives.
