@@ -42,6 +42,10 @@ struct Args {
     /// Output format
     #[arg(short, long, default_value = "sum")]
     format: PrintFormat,
+
+    /// Number of jobs. 0 means number of logical cores.
+    #[arg(short, long, default_value = "0")]
+    jobs: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -90,16 +94,17 @@ where
         }
     }
 
-    fn digest_file(&mut self, path: &Path) -> Result<()> {
-        let mut file = File::open(path)?;
+    fn _digest_print<R: Read>(&mut self, path: &Path, mut readable: R) -> Result<()> {
         loop {
-            let n = file.read(&mut self.buffer)?;
+            let n = readable.read(&mut self.buffer)?;
             if n == 0 {
                 break;
             }
             Digest::update(&mut self.hasher, &self.buffer[..n]);
         }
         digest::FixedOutputReset::finalize_into_reset(&mut self.hasher, &mut self.hash);
+
+        // `println!` locks stdout
         match self.format {
             PrintFormat::Sum => {
                 println!("{:x}  {}", self.hash, path.display());
@@ -110,6 +115,13 @@ where
         }
         Ok(())
     }
+
+    fn digest_file(&mut self, path: &Path) -> Result<()> {
+        let file = File::open(path)?;
+        self._digest_print(path, file)?;
+        Ok(())
+    }
+
     fn digest_zip(&mut self, path: &Path) -> Result<()> {
         let file = File::open(path)?;
         let mut archive = zip::ZipArchive::new(file)?;
@@ -118,53 +130,61 @@ where
             if file.is_dir() {
                 continue;
             }
-            loop {
-                let n = file.read(&mut self.buffer)?;
-                if n == 0 {
-                    break;
-                }
-                Digest::update(&mut self.hasher, &self.buffer[..n]);
-            }
-            digest::FixedOutputReset::finalize_into_reset(&mut self.hasher, &mut self.hash);
-            match self.format {
-                PrintFormat::Sum => {
-                    println!("{:x}  {}/{}", self.hash, path.display(), file.name());
-                }
-                PrintFormat::Csv => {
-                    println!("{:x},{}", self.hash, escaped_display(path));
-                }
-            }
+            self._digest_print(path, &mut file)?;
         }
         Ok(())
     }
 }
 
-fn process_input<H>(
-    hasher: &mut BufHash<H>,
-    input: &Path,
-    recursive: bool,
-    archive: bool,
-) -> Result<()>
+fn list_entries<H>(input: &Path, recursive: bool, archive: bool) -> Result<Option<Entry>>
 where
     H: Digest + FixedOutputReset,
     <H as digest::OutputSizeUser>::OutputSize: std::ops::Add,
     <<H as digest::OutputSizeUser>::OutputSize as std::ops::Add>::Output:
         digest::generic_array::ArrayLength<u8>,
 {
-    debug!("process_input: {}", input.display());
     if input.is_file() {
         if archive && input.extension().unwrap_or_default() == "zip" {
-            hasher.digest_zip(input)?;
+            return Ok(Some(Entry::Archive(vec![input.to_path_buf()])));
         } else {
-            hasher.digest_file(input)?;
+            return Ok(Some(Entry::File(input.to_path_buf())));
         }
     } else if input.is_dir() && recursive {
+        let mut entries = Vec::new();
         for entry in read_dir(input)? {
             let entry = entry?;
-            process_input(hasher, entry.path().as_path(), recursive, archive)?;
+            if let Some(e) = list_entries::<H>(entry.path().as_path(), recursive, archive)? {
+                entries.push(e);
+            }
+        }
+        return Ok(Some(Entry::Dir(entries)));
+    }
+    Ok(None)
+}
+
+#[derive(Debug)]
+enum Entry {
+    File(PathBuf),
+    Dir(Vec<Entry>),
+    Archive(Vec<PathBuf>),
+}
+
+impl Entry {
+    // fn len(&self) -> usize {
+    //     match self {
+    //         Entry::File(_) => 1,
+    //         Entry::Dir(entries) => entries.iter().map(|e| e.len()).sum(),
+    //         Entry::Archive(_) => 1,
+    //     }
+    // }
+
+    fn flatten(&self) -> Vec<&Path> {
+        match self {
+            Entry::File(path) => vec![path.as_path()],
+            Entry::Dir(entries) => entries.iter().flat_map(|e| e.flatten()).collect(),
+            Entry::Archive(paths) => paths.iter().map(|p| p.as_path()).collect(),
         }
     }
-    Ok(())
 }
 
 fn execute<H>(args: Args) -> Result<()>
@@ -184,22 +204,65 @@ where
     if args.format == PrintFormat::Csv {
         println!("hash,filename");
     }
-    let mut hasher = BufHash::<H>::new(buffer_size, args.format);
+    debug!("list files");
+    let mut all_entries = Vec::new();
     for input in args.input {
-        if input.is_file() {
-            process_input(&mut hasher, &input, args.recursive, args.archive)?;
+        let file_list = if input.is_file() {
+            list_entries::<H>(&input, args.recursive, args.archive)?
         } else if input.is_dir() {
+            let mut entries = Vec::new();
             for entry in read_dir(&input)? {
                 let entry = entry?;
-                process_input(
-                    &mut hasher,
-                    entry.path().as_path(),
-                    args.recursive,
-                    args.archive,
-                )?;
+                if let Some(e) =
+                    list_entries::<H>(entry.path().as_path(), args.recursive, args.archive)?
+                {
+                    entries.push(e);
+                }
             }
+            Some(Entry::Dir(entries))
+        } else {
+            None
         };
+        if let Some(file_list) = file_list {
+            all_entries.push(file_list);
+        }
     }
+    let all_entries = Entry::Dir(all_entries);
+    let mut v_entries = all_entries.flatten();
+    debug!("entry count: {:?}", v_entries.len());
+    let n_jobs = if args.jobs == 0 {
+        std::thread::available_parallelism()?.get()
+    } else {
+        args.jobs
+    };
+    debug!("n_jobs: {}", n_jobs);
+
+    std::thread::scope(|scope| {
+        let mut handles: Vec<_> = Vec::with_capacity(n_jobs);
+        let chunk_size = (v_entries.len() as f64 / n_jobs as f64).ceil() as usize;
+        for chunk in v_entries.chunks_mut(chunk_size) {
+            handles.push(scope.spawn(|| {
+                let mut hasher = BufHash::<H>::new(buffer_size, args.format);
+                for entry in chunk {
+                    match entry.extension().unwrap_or_default().to_str() {
+                        Some("zip") => {
+                            if args.archive {
+                                hasher.digest_zip(entry).unwrap();
+                            } else {
+                                hasher.digest_file(entry).unwrap();
+                            }
+                        }
+                        _ => {
+                            hasher.digest_file(entry).unwrap();
+                        }
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    });
     Ok(())
 }
 
