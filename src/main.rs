@@ -1,15 +1,128 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Parser;
 use digest::{Digest, FixedOutputReset};
 use log::debug;
-use std::fs::read_dir;
+use std::marker::Send;
 use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
 };
+use std::{
+    sync::{mpsc, Arc, Mutex},
+    thread,
+};
+use walkdir::{DirEntry, WalkDir};
 
-#[derive(Debug, Clone, clap::ValueEnum)]
+fn is_hidden(entry: &DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .map(|s| s.starts_with('.'))
+        .unwrap_or(false)
+}
+
+pub struct ThreadPool {
+    workers: Vec<Worker>,
+    sender: Option<mpsc::Sender<Job>>,
+}
+
+enum Job {
+    File(PathBuf),
+    Archive(PathBuf),
+}
+
+impl ThreadPool {
+    /// Create a new ThreadPool.
+    ///
+    /// The size is the number of threads in the pool.
+    ///
+    /// # Panics
+    ///
+    /// The `new` function will panic if the size is zero.
+    fn new(
+        size: usize,
+        buffer_size: usize,
+        format: PrintFormat,
+        algorithm: Algorithm,
+    ) -> ThreadPool {
+        assert!(size > 0);
+
+        let (sender, receiver) = mpsc::channel();
+
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        let mut workers = Vec::with_capacity(size);
+
+        for id in 0..size {
+            let hasher: Box<dyn DigestPrint> = match algorithm {
+                Algorithm::Md5 => Box::new(BufHash::<md5::Md5>::new(buffer_size, format)),
+                Algorithm::Sha1 => Box::new(BufHash::<sha1::Sha1>::new(buffer_size, format)),
+            };
+            workers.push(Worker::new(id, hasher, Arc::clone(&receiver)));
+        }
+
+        ThreadPool {
+            workers,
+            sender: Some(sender),
+        }
+    }
+    fn process_file(&mut self, path: PathBuf) {
+        self.sender.as_ref().unwrap().send(Job::File(path)).unwrap();
+    }
+    fn process_archive(&mut self, path: PathBuf) {
+        self.sender
+            .as_ref()
+            .unwrap()
+            .send(Job::Archive(path))
+            .unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+
+        for worker in &mut self.workers {
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+}
+
+struct Worker {
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Worker {
+    fn new(
+        id: usize,
+        mut hasher: Box<dyn DigestPrint>,
+        receiver: Arc<Mutex<mpsc::Receiver<Job>>>,
+    ) -> Worker {
+        let thread = thread::spawn(move || loop {
+            let message = receiver.lock().unwrap().recv();
+
+            match message {
+                Ok(job) => match job {
+                    Job::File(path) => hasher.digest_file(&path).unwrap(),
+                    Job::Archive(path) => hasher.digest_zip(&path).unwrap(),
+                },
+                Err(_) => {
+                    debug!("Worker {id} disconnected; shutting down.");
+                    break;
+                }
+            }
+        });
+
+        Worker {
+            thread: Some(thread),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum Algorithm {
     Md5,
     Sha1,
@@ -26,15 +139,15 @@ struct Args {
     #[arg(long, default_value = "md5")]
     hash: Algorithm,
 
-    /// All files including hidden files
+    /// Hash all files including hidden files
     #[arg(short, long)]
     all: bool,
 
-    /// Recursive search
+    /// Hash files in subdirectories recursively
     #[arg(short, long)]
     recursive: bool,
 
-    /// Buffer size
+    /// Buffer size for reading and hashing
     #[arg(short, long, default_value = "1M")]
     buffer: String,
 
@@ -42,7 +155,7 @@ struct Args {
     #[arg(long)]
     archive: bool,
 
-    /// Output format
+    /// Print format
     #[arg(short, long, default_value = "sum")]
     format: PrintFormat,
 
@@ -95,6 +208,11 @@ struct BufHash<H: Digest + FixedOutputReset> {
     buffer: Vec<u8>,
 }
 
+trait DigestPrint: Send {
+    fn digest_file(&mut self, path: &Path) -> Result<()>;
+    fn digest_zip(&mut self, path: &Path) -> Result<()>;
+}
+
 impl<H> BufHash<H>
 where
     H: Digest + FixedOutputReset,
@@ -135,7 +253,15 @@ where
         }
         Ok(())
     }
+}
 
+impl<H> DigestPrint for BufHash<H>
+where
+    H: Digest + FixedOutputReset + Send,
+    <H as digest::OutputSizeUser>::OutputSize: std::ops::Add,
+    <<H as digest::OutputSizeUser>::OutputSize as std::ops::Add>::Output:
+        digest::generic_array::ArrayLength<u8>,
+{
     fn digest_file(&mut self, path: &Path) -> Result<()> {
         let file = File::open(path)?;
         self._digest_print(path, file)?;
@@ -157,57 +283,38 @@ where
     }
 }
 
-fn is_dotfile(path: &Path) -> bool {
-    path.file_name().unwrap().to_str().unwrap().starts_with('.')
-}
-
-fn list_entries<H>(input: PathBuf, flags: Flags) -> Result<Option<Entry>>
-where
-    H: Digest + FixedOutputReset,
-    <H as digest::OutputSizeUser>::OutputSize: std::ops::Add,
-    <<H as digest::OutputSizeUser>::OutputSize as std::ops::Add>::Output:
-        digest::generic_array::ArrayLength<u8>,
-{
-    if !flags.all && is_dotfile(&input) {
-        return Ok(None);
-    }
-    if input.is_file() {
-        return Ok(Some(Entry::File(input)));
-    } else if input.is_dir() && flags.recursive {
-        let mut entries = Vec::new();
-        for entry in read_dir(input)? {
-            let entry = entry?;
-            if let Some(e) = list_entries::<H>(entry.path(), flags)? {
-                entries.push(e);
-            }
+fn process_file(pool: &mut ThreadPool, input: PathBuf, flags: Flags) {
+    if flags.archive {
+        match input.extension().unwrap_or_default().to_str() {
+            Some("zip") => pool.process_archive(input),
+            _ => pool.process_file(input),
         }
-        return Ok(Some(Entry::Dir(entries)));
+    } else {
+        pool.process_file(input);
     }
-    Ok(None)
 }
 
-#[derive(Debug)]
-enum Entry {
-    File(PathBuf),
-    Dir(Vec<Entry>),
-}
-
-impl Entry {
-    fn flatten(&self) -> Vec<&Path> {
-        match self {
-            Entry::File(path) => vec![path.as_path()],
-            Entry::Dir(entries) => entries.iter().flat_map(|e| e.flatten()).collect(),
+fn process_dir(pool: &mut ThreadPool, input: PathBuf, flags: Flags) -> Result<()> {
+    let walker = if flags.recursive {
+        WalkDir::new(input)
+    } else {
+        WalkDir::new(input).min_depth(1).max_depth(1)
+    };
+    for entry in walker
+        .into_iter()
+        .filter_entry(|e| flags.all || !is_hidden(e))
+    {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            process_file(pool, entry.into_path(), flags);
         }
     }
+    Ok(())
 }
 
-fn execute<H>(args: Args) -> Result<()>
-where
-    H: Digest + FixedOutputReset,
-    <H as digest::OutputSizeUser>::OutputSize: std::ops::Add,
-    <<H as digest::OutputSizeUser>::OutputSize as std::ops::Add>::Output:
-        digest::generic_array::ArrayLength<u8>,
-{
+fn main() -> Result<()> {
+    env_logger::init();
+    let args = Args::parse();
     let buffer_size: usize = parse_size::parse_size(&args.buffer).map_err(|e| {
         anyhow::anyhow!(
             "Failed to parse buffer size: {} (example: 1M, 1MiB, 1MB, 1Mib, 1m, 1, ...)",
@@ -218,77 +325,25 @@ where
     if args.format == PrintFormat::Csv {
         println!("hash,filename");
     }
-    let flags = Flags::from(&args);
-    debug!("list files");
-    let mut all_entries = Vec::new();
-    for input in args.input {
-        // list files regardless of all or recursive option
-        let file_list = if input.is_file() {
-            list_entries::<H>(input, flags)?
-        } else if input.is_dir() {
-            let mut entries = Vec::new();
-            for entry in read_dir(&input)? {
-                let entry = entry?;
-                if !flags.all && is_dotfile(&entry.path()) {
-                    continue;
-                }
-                if let Some(e) = list_entries::<H>(entry.path(), flags)? {
-                    entries.push(e);
-                }
-            }
-            Some(Entry::Dir(entries))
-        } else {
-            None
-        };
-        if let Some(file_list) = file_list {
-            all_entries.push(file_list);
-        }
-    }
-    let all_entries = Entry::Dir(all_entries);
-    let mut path_list = all_entries.flatten();
-    debug!("entry count: {:?}", path_list.len());
     let n_jobs = if args.jobs == 0 {
         std::thread::available_parallelism()?.get()
     } else {
         args.jobs
     };
     debug!("n_jobs: {}", n_jobs);
+    let mut pool = ThreadPool::new(n_jobs, buffer_size, args.format, args.hash);
 
-    std::thread::scope(|scope| {
-        let mut handles: Vec<_> = Vec::with_capacity(n_jobs);
-        let chunk_size = (path_list.len() as f64 / n_jobs as f64).ceil() as usize;
-        for chunk in path_list.chunks_mut(chunk_size) {
-            handles.push(scope.spawn(|| {
-                let mut hasher = BufHash::<H>::new(buffer_size, args.format);
-                for entry in chunk {
-                    match entry.extension().unwrap_or_default().to_str() {
-                        Some("zip") => {
-                            if flags.archive {
-                                hasher.digest_zip(entry).unwrap();
-                            } else {
-                                hasher.digest_file(entry).unwrap();
-                            }
-                        }
-                        _ => {
-                            hasher.digest_file(entry).unwrap();
-                        }
-                    }
-                }
-            }));
+    let flags = Flags::from(&args);
+    // process inputs regardless of all option
+    for input in args.input {
+        if !input.exists() {
+            bail!("{}: No such file or directory", input.display());
         }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    });
-    Ok(())
-}
-
-fn main() -> Result<()> {
-    env_logger::init();
-    let args = Args::parse();
-
-    match args.hash {
-        Algorithm::Md5 => execute::<md5::Md5>(args),
-        Algorithm::Sha1 => execute::<sha1::Sha1>(args),
+        if input.is_file() {
+            process_file(&mut pool, input, flags);
+        } else if input.is_dir() {
+            process_dir(&mut pool, input, flags)?;
+        };
     }
+    Ok(())
 }

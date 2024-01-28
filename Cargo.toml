@@ -15,4 +15,9 @@ log = "0.4.20"
 md-5 = "0.10.6"
 parse-size = "1.0.0"
 sha1 = "0.10.6"
+walkdir = "2.4.0"
 zip = "0.6.6"
+
+[dev-dependencies]
+assert_cmd = "2.0.13"
+pretty_assertions = "1.4.0"
