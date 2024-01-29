@@ -34,6 +34,9 @@ fn setup() {
                 OUT_ARC_TAR = leaky_replace_to_win(OUT_ARC_TAR);
                 OUT_ARC_TAR_GZ = leaky_replace_to_win(OUT_ARC_TAR_GZ);
                 OUT_ARC_TAR_ZST = leaky_replace_to_win(OUT_ARC_TAR_ZST);
+                OUT_ARC_TAR_BZ2 = leaky_replace_to_win(OUT_ARC_TAR_BZ2);
+                OUT_ARC_TAR_XZ = leaky_replace_to_win(OUT_ARC_TAR_XZ);
+
                 OUT_ARC_CONTENTS = leaky_replace_to_win(OUT_ARC_CONTENTS);
 
                 // Not replacing in the archive
@@ -58,6 +61,10 @@ static mut OUT_ARC_ZIP: &str = "96e0b59e98d0afac097caca640ae89a7  ./archive.zip"
 static mut OUT_ARC_TAR: &str = "93bd005392ba45a764e048f936745f29  ./archive.tar";
 static mut OUT_ARC_TAR_GZ: &str = "697bfc68b92d00748110bfe0003da43e  ./archive.tar.gz";
 static mut OUT_ARC_TAR_ZST: &str = "2d091500d5eaf8b02cab3f82aabb85e5  ./archive.tar.zst";
+static mut OUT_ARC_TAR_BZ2: &str = "11ead6a83b86a95427fca0f3d4dba0c7  ./archive.tar.bz2";
+static mut OUT_ARC_TAR_XZ: &str = "f067faa0bcfbda70e280a85c40d74a4e  ./archive.tar.xz";
+
+//
 
 static mut OUT_ARC_CONTENTS: &str = "\
 ac175545a9b0f6da0d5c03f5135563d8  archive.zip/file.txt
@@ -85,11 +92,13 @@ fn test_files() -> Result<()> {
         unsafe {
             [
                 "",
+                OUT_ARC_TAR_BZ2,
                 OUT_ARC_TAR_ZST,
                 OUT_ARC_TAR_GZ,
                 OUT_ARC_TAR,
                 OUT_ARC_ZIP,
                 OUT_FILE,
+                OUT_ARC_TAR_XZ,
             ]
         }
         .join("\n")
@@ -104,12 +113,14 @@ fn test_files() -> Result<()> {
         unsafe {
             [
                 "",
+                OUT_ARC_TAR_BZ2,
                 OUT_HIDFILE,
                 OUT_ARC_TAR_ZST,
                 OUT_ARC_TAR_GZ,
                 OUT_ARC_TAR,
                 OUT_ARC_ZIP,
                 OUT_FILE,
+                OUT_ARC_TAR_XZ,
             ]
         }
         .join("\n")
@@ -124,6 +135,7 @@ fn test_files() -> Result<()> {
         unsafe {
             [
                 "",
+                OUT_ARC_TAR_BZ2,
                 OUT_HIDDIR_FILE,
                 OUT_HIDFILE,
                 OUT_ARC_TAR_ZST,
@@ -132,6 +144,7 @@ fn test_files() -> Result<()> {
                 OUT_ARC_TAR,
                 OUT_ARC_ZIP,
                 OUT_FILE,
+                OUT_ARC_TAR_XZ,
             ]
         }
         .join("\n")
@@ -160,23 +173,31 @@ fn test_tar() -> Result<()> {
     cmd.args(["archive.tar", "--archive"]);
     cmd.assert().success().stdout(tar_contents);
 
-    let tar_gz_contents = unsafe { OUT_ARC_CONTENTS.replace(".zip", ".tar.gz") };
-    let mut cmd = Command::cargo_bin("hashall").unwrap();
-    cmd.args(["archive.tar.gz", "--archive"]);
-    cmd.assert().success().stdout(tar_gz_contents);
+    test_tar_compress(".tar.gz")
+}
 
+fn test_tar_compress(extension: &str) -> Result<()> {
+    setup();
+    let contents = unsafe { OUT_ARC_CONTENTS.replace(".zip", extension) };
+    let mut cmd = Command::cargo_bin("hashall").unwrap();
+    cmd.args(["archive".to_owned() + extension, "--archive".to_owned()]);
+    cmd.assert().success().stdout(contents);
     Ok(())
 }
 
 #[test]
 fn test_zst() -> Result<()> {
-    setup();
-    let zst_contents = unsafe { OUT_ARC_CONTENTS.replace(".zip", ".tar.zst") };
-    let mut cmd = Command::cargo_bin("hashall").unwrap();
-    cmd.args(["archive.tar.zst", "--archive"]);
-    cmd.assert().success().stdout(zst_contents);
+    test_tar_compress(".tar.zst")
+}
 
-    Ok(())
+#[test]
+fn test_bz2() -> Result<()> {
+    test_tar_compress(".tar.bz2")
+}
+
+#[test]
+fn test_xz() -> Result<()> {
+    test_tar_compress(".tar.xz")
 }
 
 #[test]

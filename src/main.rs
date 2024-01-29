@@ -147,7 +147,7 @@ struct Args {
     #[arg(short, long, default_value = "1M")]
     buffer: String,
 
-    /// Hash files in archive files (zip, tar, tar.gz, and tar.zst)
+    /// Hash files in archive files (zip, tar, tar.{gz,bz2,xz,zst})
     #[arg(long)]
     archive: bool,
 
@@ -291,6 +291,16 @@ where
         let file = File::open(path)?;
         self._digest_tar(path, zstd::Decoder::new(file)?)
     }
+
+    fn digest_tar_bz2(&mut self, path: &Path) -> Result<()> {
+        let file = File::open(path)?;
+        self._digest_tar(path, bzip2::read::BzDecoder::new(file))
+    }
+
+    fn digest_tar_xz(&mut self, path: &Path) -> Result<()> {
+        let file = File::open(path)?;
+        self._digest_tar(path, xz2::read::XzDecoder::new(file))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -322,6 +332,8 @@ enum ArchiveType {
     Tar,
     TarGz,
     TarZstd,
+    TarBz2,
+    TarXz,
 }
 
 impl ArchiveType {
@@ -333,10 +345,12 @@ impl ArchiveType {
         match (path.extension().unwrap_or_default().to_str(), is_tar) {
             (Some("zip"), _) => Some(ArchiveType::Zip),
             (Some("tar"), _) => Some(ArchiveType::Tar),
-            (Some("tgz"), _) => Some(ArchiveType::TarGz),
-            (Some("taz"), _) => Some(ArchiveType::TarGz),
+            (Some("tgz") | Some("taz"), _) => Some(ArchiveType::TarGz),
+            (Some("tz2") | Some("tbz") | Some("tbz2"), _) => Some(ArchiveType::TarBz2),
             (Some("gz"), true) => Some(ArchiveType::TarGz),
             (Some("zst"), true) => Some(ArchiveType::TarZstd),
+            (Some("bz2"), true) => Some(ArchiveType::TarBz2),
+            (Some("xz"), true) => Some(ArchiveType::TarXz),
             _ => None,
         }
     }
@@ -361,6 +375,8 @@ where
             ArchiveType::Tar => self.digest_tar(path),
             ArchiveType::TarGz => self.digest_tar_gz(path),
             ArchiveType::TarZstd => self.digest_tar_zstd(path),
+            ArchiveType::TarBz2 => self.digest_tar_bz2(path),
+            ArchiveType::TarXz => self.digest_tar_xz(path),
         }
     }
 }
@@ -454,6 +470,7 @@ mod tests {
             ArchiveType::from_path(Path::new("archive.tar")).unwrap(),
             ArchiveType::Tar
         );
+
         assert_eq!(
             ArchiveType::from_path(Path::new("archive.tar.gz")).unwrap(),
             ArchiveType::TarGz
@@ -474,9 +491,30 @@ mod tests {
             ArchiveType::from_path(Path::new("archive.tar.gz/")).unwrap(),
             ArchiveType::TarGz
         );
+
         assert_eq!(
             ArchiveType::from_path(Path::new("archive.tar.zst")).unwrap(),
             ArchiveType::TarZstd
+        );
+        assert_eq!(
+            ArchiveType::from_path(Path::new("archive.tar.bz2")).unwrap(),
+            ArchiveType::TarBz2
+        );
+        assert_eq!(
+            ArchiveType::from_path(Path::new("archive.tz2")).unwrap(),
+            ArchiveType::TarBz2
+        );
+        assert_eq!(
+            ArchiveType::from_path(Path::new("archive.tbz")).unwrap(),
+            ArchiveType::TarBz2
+        );
+        assert_eq!(
+            ArchiveType::from_path(Path::new("archive.tbz2")).unwrap(),
+            ArchiveType::TarBz2
+        );
+        assert_eq!(
+            ArchiveType::from_path(Path::new("archive.tar.xz")).unwrap(),
+            ArchiveType::TarXz
         );
     }
 }

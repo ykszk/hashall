@@ -1,6 +1,6 @@
 # hashall
 
-A simple CLI tool to hash all files in a directory.
+A simple CLI tool to hash all files in a directory (and files in the archive files).
 
 
 # Examples
@@ -10,7 +10,7 @@ Hash all files and files inside archives recursively:
 hashall . -r --archive
 ```
 
-Note: `--archive` option only handles `.zip`, `.tar`, `.tar.gz`, and `.tar.zst`
+Note: `--archive` option handles `.zip`, `.tar`, `.tar.gz`, `.tar.bz2`, `.tar.xz`, and `.tar.zst`
 
 Print in csv format:
 ```console
