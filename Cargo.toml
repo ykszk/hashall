@@ -19,6 +19,7 @@ sha1 = "0.10.6"
 tar = "0.4.40"
 walkdir = "2.4.0"
 zip = "0.6.6"
+zstd = "0.13.0"
 
 [dev-dependencies]
 assert_cmd = "2.0.13"

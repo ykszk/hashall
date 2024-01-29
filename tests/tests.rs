@@ -21,6 +21,7 @@ const OUT_HIDDIR_FILE: &str = "13685f3b85a79a59e6e6c7aebdf2abd4  ./.hidden/file.
 const OUT_ARC_ZIP: &str = "96e0b59e98d0afac097caca640ae89a7  ./archive.zip";
 const OUT_ARC_TAR: &str = "93bd005392ba45a764e048f936745f29  ./archive.tar";
 const OUT_ARC_TAR_GZ: &str = "697bfc68b92d00748110bfe0003da43e  ./archive.tar.gz";
+const OUT_ARC_TAR_ZST: &str = "2d091500d5eaf8b02cab3f82aabb85e5  ./archive.tar.zst";
 
 const OUT_ARC_CONTENTS: &str = "\
 ac175545a9b0f6da0d5c03f5135563d8  ./archive.zip/file.txt
@@ -45,7 +46,15 @@ fn test_files() -> Result<()> {
     let output = sort_output(cmd.output()?.stdout)?;
     assert_eq!(
         output,
-        ["", OUT_ARC_TAR_GZ, OUT_ARC_TAR, OUT_ARC_ZIP, OUT_FILE].join("\n")
+        [
+            "",
+            OUT_ARC_TAR_ZST,
+            OUT_ARC_TAR_GZ,
+            OUT_ARC_TAR,
+            OUT_ARC_ZIP,
+            OUT_FILE
+        ]
+        .join("\n")
     );
 
     let mut cmd = Command::cargo_bin("hashall").unwrap();
@@ -57,6 +66,7 @@ fn test_files() -> Result<()> {
         [
             "",
             OUT_HIDFILE,
+            OUT_ARC_TAR_ZST,
             OUT_ARC_TAR_GZ,
             OUT_ARC_TAR,
             OUT_ARC_ZIP,
@@ -75,6 +85,7 @@ fn test_files() -> Result<()> {
             "",
             OUT_HIDDIR_FILE,
             OUT_HIDFILE,
+            OUT_ARC_TAR_ZST,
             OUT_DIR_FILE,
             OUT_ARC_TAR_GZ,
             OUT_ARC_TAR,
@@ -109,6 +120,18 @@ fn test_tar() -> Result<()> {
     let mut cmd = Command::cargo_bin("hashall").unwrap();
     cmd.args(["./archive.tar.gz", "--archive"]);
     cmd.assert().success().stdout(tar_gz_contents);
+
+    Ok(())
+}
+
+#[test]
+fn test_zst() -> Result<()> {
+    setup();
+    let zst_contents = OUT_ARC_CONTENTS.replace(".zip", ".tar.zst");
+
+    let mut cmd = Command::cargo_bin("hashall").unwrap();
+    cmd.args(["./archive.tar.zst", "--archive"]);
+    cmd.assert().success().stdout(zst_contents);
 
     Ok(())
 }

@@ -31,7 +31,7 @@ pub struct ThreadPool {
 
 enum Job {
     File(PathBuf),
-    Archive(PathBuf),
+    Archive((PathBuf, ArchiveType)),
 }
 
 impl ThreadPool {
@@ -72,11 +72,11 @@ impl ThreadPool {
     fn process_file(&mut self, path: PathBuf) {
         self.sender.as_ref().unwrap().send(Job::File(path)).unwrap();
     }
-    fn process_archive(&mut self, path: PathBuf) {
+    fn process_archive(&mut self, path: PathBuf, archive_type: ArchiveType) {
         self.sender
             .as_ref()
             .unwrap()
-            .send(Job::Archive(path))
+            .send(Job::Archive((path, archive_type)))
             .unwrap();
     }
 }
@@ -109,7 +109,9 @@ impl Worker {
             match message {
                 Ok(job) => match job {
                     Job::File(path) => hasher.digest_file(&path).unwrap(),
-                    Job::Archive(path) => hasher.digest_archive(&path).unwrap(),
+                    Job::Archive((path, archive_type)) => {
+                        hasher.digest_archive(&path, archive_type).unwrap()
+                    }
                 },
                 Err(_) => {
                     debug!("Worker {id} disconnected; shutting down.");
@@ -153,7 +155,7 @@ struct Args {
     #[arg(short, long, default_value = "1M")]
     buffer: String,
 
-    /// Hash files in archive files such as zip, tar, tar.gz
+    /// Hash files in archive files (zip, tar, tar.gz, and tar.zst)
     #[arg(long)]
     archive: bool,
 
@@ -212,7 +214,7 @@ struct BufHash<H: Digest + FixedOutputReset> {
 
 trait DigestPrint: Send {
     fn digest_file(&mut self, path: &Path) -> Result<()>;
-    fn digest_archive(&mut self, path: &Path) -> Result<()>;
+    fn digest_archive(&mut self, path: &Path, archive_type: ArchiveType) -> Result<()>;
 }
 
 impl<H> BufHash<H>
@@ -292,32 +294,33 @@ where
         let file = File::open(path)?;
         self._digest_tar(path, GzDecoder::new(file))
     }
+
+    fn digest_tar_zstd(&mut self, path: &Path) -> Result<()> {
+        let file = File::open(path)?;
+        self._digest_tar(path, zstd::Decoder::new(file)?)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ArchiveType {
-    None,
     Zip,
     Tar,
     TarGz,
+    TarZstd,
 }
 
 impl ArchiveType {
-    fn from_path(path: &Path) -> Self {
-        match path.extension().unwrap_or_default().to_str() {
-            Some("zip") => ArchiveType::Zip,
-            Some("tar") => ArchiveType::Tar,
-            Some("gz") => {
-                if path
-                    .file_stem()
-                    .map_or(false, |s| s.to_string_lossy().ends_with(".tar"))
-                {
-                    ArchiveType::TarGz
-                } else {
-                    ArchiveType::None
-                }
-            }
-            _ => ArchiveType::None,
+    fn from_path(path: &Path) -> Option<Self> {
+        let is_tar = path
+            .file_stem()
+            .map_or(false, |s| s.to_string_lossy().ends_with(".tar"));
+
+        match (path.extension().unwrap_or_default().to_str(), is_tar) {
+            (Some("zip"), _) => Some(ArchiveType::Zip),
+            (Some("tar"), _) => Some(ArchiveType::Tar),
+            (Some("gz"), true) => Some(ArchiveType::TarGz),
+            (Some("zst"), true) => Some(ArchiveType::TarZstd),
+            _ => None,
         }
     }
 }
@@ -335,23 +338,22 @@ where
         Ok(())
     }
 
-    fn digest_archive(&mut self, path: &Path) -> Result<()> {
-        let archive_type = ArchiveType::from_path(path);
+    fn digest_archive(&mut self, path: &Path, archive_type: ArchiveType) -> Result<()> {
         match archive_type {
             ArchiveType::Zip => self.digest_zip(path),
             ArchiveType::Tar => self.digest_tar(path),
             ArchiveType::TarGz => self.digest_tar_gz(path),
-            _ => Ok(()),
+            ArchiveType::TarZstd => self.digest_tar_zstd(path),
         }
     }
 }
 
 fn process_file(pool: &mut ThreadPool, input: PathBuf, flags: Flags) {
     if flags.archive {
-        let archive_type = ArchiveType::from_path(&input);
-        match archive_type {
-            ArchiveType::None => pool.process_file(input),
-            _ => pool.process_archive(input),
+        if let Some(archive_type) = ArchiveType::from_path(&input) {
+            pool.process_archive(input, archive_type);
+        } else {
+            pool.process_file(input);
         }
     } else {
         pool.process_file(input);
@@ -418,34 +420,25 @@ mod tests {
 
     #[test]
     fn test_archive_type() {
+        assert!(ArchiveType::from_path(Path::new("file.txt")).is_none());
         assert_eq!(
-            ArchiveType::from_path(Path::new("file.txt")),
-            ArchiveType::None
-        );
-        assert_eq!(
-            ArchiveType::from_path(Path::new("archive.zip")),
+            ArchiveType::from_path(Path::new("archive.zip")).unwrap(),
             ArchiveType::Zip
         );
         assert_eq!(
-            ArchiveType::from_path(Path::new("archive.tar")),
+            ArchiveType::from_path(Path::new("archive.tar")).unwrap(),
             ArchiveType::Tar
         );
         assert_eq!(
-            ArchiveType::from_path(Path::new("archive.tar.gz")),
+            ArchiveType::from_path(Path::new("archive.tar.gz")).unwrap(),
             ArchiveType::TarGz
         );
-        assert_eq!(
-            ArchiveType::from_path(Path::new("archive.gz")),
-            ArchiveType::None
-        );
-        assert_eq!(
-            ArchiveType::from_path(Path::new("archive.tar.gz.txt")),
-            ArchiveType::None
-        );
+        assert!(ArchiveType::from_path(Path::new("archive.gz")).is_none(),);
+        assert!(ArchiveType::from_path(Path::new("archive.tar.gz.txt")).is_none(),);
         // This should be None.
         // Leaving it as TarGz for now because directory input does not reach this function.
         assert_eq!(
-            ArchiveType::from_path(Path::new("archive.tar.gz/")),
+            ArchiveType::from_path(Path::new("archive.tar.gz/")).unwrap(),
             ArchiveType::TarGz
         );
     }
