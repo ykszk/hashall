@@ -333,6 +333,8 @@ impl ArchiveType {
         match (path.extension().unwrap_or_default().to_str(), is_tar) {
             (Some("zip"), _) => Some(ArchiveType::Zip),
             (Some("tar"), _) => Some(ArchiveType::Tar),
+            (Some("tgz"), _) => Some(ArchiveType::TarGz),
+            (Some("taz"), _) => Some(ArchiveType::TarGz),
             (Some("gz"), true) => Some(ArchiveType::TarGz),
             (Some("zst"), true) => Some(ArchiveType::TarZstd),
             _ => None,
@@ -456,6 +458,14 @@ mod tests {
             ArchiveType::from_path(Path::new("archive.tar.gz")).unwrap(),
             ArchiveType::TarGz
         );
+        assert_eq!(
+            ArchiveType::from_path(Path::new("archive.tgz")).unwrap(),
+            ArchiveType::TarGz
+        );
+        assert_eq!(
+            ArchiveType::from_path(Path::new("archive.taz")).unwrap(),
+            ArchiveType::TarGz
+        );
         assert!(ArchiveType::from_path(Path::new("archive.gz")).is_none(),);
         assert!(ArchiveType::from_path(Path::new("archive.tar.gz.txt")).is_none(),);
         // This should be None.
@@ -463,6 +473,10 @@ mod tests {
         assert_eq!(
             ArchiveType::from_path(Path::new("archive.tar.gz/")).unwrap(),
             ArchiveType::TarGz
+        );
+        assert_eq!(
+            ArchiveType::from_path(Path::new("archive.tar.zst")).unwrap(),
+            ArchiveType::TarZstd
         );
     }
 }
