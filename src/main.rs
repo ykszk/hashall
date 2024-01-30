@@ -393,8 +393,8 @@ impl ArchiveType {
         match (path.extension().unwrap_or_default().to_str(), is_tar) {
             (Some("zip"), _) => Some(ArchiveType::Zip),
             (Some("tar"), _) => Some(ArchiveType::Tar),
-            (Some("tgz") | Some("taz"), _) => Some(ArchiveType::TarGz),
-            (Some("tz2") | Some("tbz") | Some("tbz2"), _) => Some(ArchiveType::TarBz2),
+            (Some("tgz" | "taz"), _) => Some(ArchiveType::TarGz),
+            (Some("tz2" | "tbz" | "tbz2"), _) => Some(ArchiveType::TarBz2),
             (Some("gz"), true) => Some(ArchiveType::TarGz),
             (Some("zst"), true) => Some(ArchiveType::TarZstd),
             (Some("bz2"), true) => Some(ArchiveType::TarBz2),
@@ -463,12 +463,12 @@ fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
 
-    let buffer_size: usize = parse_size::parse_size(&args.buffer).map_err(|e| {
+    let buffer_size = usize::try_from(parse_size::parse_size(&args.buffer).map_err(|e| {
         anyhow::anyhow!(
             "Failed to parse buffer size: {} (example: 1M, 1MiB, 1MB, 1Mib, 1m, 1, ...)",
             e
         )
-    })? as usize;
+    })?)?;
     debug!("buffer_size: {}", buffer_size);
 
     if args.format == PrintFormat::Csv {
