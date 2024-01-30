@@ -122,6 +122,18 @@ impl Worker {
 enum Algorithm {
     Md5,
     Sha1,
+    Sha224,
+    Sha256,
+    #[clap(name = "sha512/224")]
+    Sha512_224,
+    #[clap(name = "sha512/256")]
+    Sha512_256,
+    Sha384,
+    Sha512,
+    Sha3_224,
+    Sha3_256,
+    Sha3_384,
+    Sha3_512,
 }
 
 #[derive(Parser, Debug)]
@@ -236,7 +248,7 @@ where
             }
             Digest::update(&mut self.hasher, &self.buffer[..n]);
         }
-        digest::FixedOutputReset::finalize_into_reset(&mut self.hasher, &mut self.hash);
+        FixedOutputReset::finalize_into_reset(&mut self.hasher, &mut self.hash);
 
         // No need for manual locking because println! locks stdout.
         match self.format {
@@ -322,6 +334,42 @@ impl BufHashFactory {
         match self.algorithm {
             Algorithm::Md5 => Box::new(BufHash::<md5::Md5>::new(self.buffer_size, self.format)),
             Algorithm::Sha1 => Box::new(BufHash::<sha1::Sha1>::new(self.buffer_size, self.format)),
+            Algorithm::Sha224 => {
+                Box::new(BufHash::<sha2::Sha224>::new(self.buffer_size, self.format))
+            }
+            Algorithm::Sha256 => {
+                Box::new(BufHash::<sha2::Sha256>::new(self.buffer_size, self.format))
+            }
+            Algorithm::Sha512_224 => Box::new(BufHash::<sha2::Sha512_224>::new(
+                self.buffer_size,
+                self.format,
+            )),
+            Algorithm::Sha512_256 => Box::new(BufHash::<sha2::Sha512_256>::new(
+                self.buffer_size,
+                self.format,
+            )),
+            Algorithm::Sha384 => {
+                Box::new(BufHash::<sha2::Sha384>::new(self.buffer_size, self.format))
+            }
+            Algorithm::Sha512 => {
+                Box::new(BufHash::<sha2::Sha512>::new(self.buffer_size, self.format))
+            }
+            Algorithm::Sha3_224 => Box::new(BufHash::<sha3::Sha3_224>::new(
+                self.buffer_size,
+                self.format,
+            )),
+            Algorithm::Sha3_256 => Box::new(BufHash::<sha3::Sha3_256>::new(
+                self.buffer_size,
+                self.format,
+            )),
+            Algorithm::Sha3_384 => Box::new(BufHash::<sha3::Sha3_384>::new(
+                self.buffer_size,
+                self.format,
+            )),
+            Algorithm::Sha3_512 => Box::new(BufHash::<sha3::Sha3_512>::new(
+                self.buffer_size,
+                self.format,
+            )),
         }
     }
 }

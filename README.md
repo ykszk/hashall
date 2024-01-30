@@ -17,6 +17,11 @@ Print in csv format:
 hashall . --format csv
 ```
 
+Use SHA-1 instead of MD5:
+```console
+hashall . --hash sha1
+```
+
 Single thread only:
 ```console
 hashall . -j 1
