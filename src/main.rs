@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use digest::{generic_array::GenericArray, Digest, FixedOutputReset};
 use flate2::read::GzDecoder;
+use indicatif::{ProgressBar, ProgressStyle};
 use log::debug;
 use std::{
     fs::File,
@@ -25,6 +26,7 @@ fn is_hidden(entry: &DirEntry) -> bool {
 pub struct ThreadPool {
     workers: Vec<Worker>,
     sender: Option<mpsc::Sender<Job>>,
+    bar: Option<ProgressBar>,
 }
 
 enum Job {
@@ -40,7 +42,7 @@ impl ThreadPool {
     /// # Panics
     ///
     /// The `new` function will panic if the size is zero.
-    fn new(size: usize, hasher_factory: BufHashFactory) -> ThreadPool {
+    fn new(size: usize, hasher_factory: BufHashFactory, bar: Option<ProgressBar>) -> ThreadPool {
         assert!(size > 0);
 
         let (sender, receiver) = mpsc::channel();
@@ -50,12 +52,18 @@ impl ThreadPool {
         let mut workers = Vec::with_capacity(size);
 
         for id in 0..size {
-            workers.push(Worker::new(id, hasher_factory, Arc::clone(&receiver)));
+            workers.push(Worker::new(
+                id,
+                hasher_factory,
+                Arc::clone(&receiver),
+                bar.clone(),
+            ));
         }
 
         ThreadPool {
             workers,
             sender: Some(sender),
+            bar,
         }
     }
     fn process_file(&mut self, path: PathBuf) {
@@ -79,6 +87,9 @@ impl Drop for ThreadPool {
                 thread.join().unwrap();
             }
         }
+        if let Some(bar) = self.bar.as_ref() {
+            bar.finish();
+        }
     }
 }
 
@@ -91,6 +102,7 @@ impl Worker {
         id: usize,
         hasher_factory: BufHashFactory,
         receiver: Arc<Mutex<mpsc::Receiver<Job>>>,
+        bar: Option<ProgressBar>,
     ) -> Worker {
         let thread = thread::spawn(move || {
             let mut hasher = hasher_factory.create();
@@ -98,12 +110,17 @@ impl Worker {
                 let message = receiver.lock().unwrap().recv();
 
                 match message {
-                    Ok(job) => match job {
-                        Job::File(path) => hasher.digest_file(&path).unwrap(),
-                        Job::Archive((path, archive_type)) => {
-                            hasher.digest_archive(&path, archive_type).unwrap();
+                    Ok(job) => {
+                        match job {
+                            Job::File(path) => hasher.digest_file(&path).unwrap(),
+                            Job::Archive((path, archive_type)) => {
+                                hasher.digest_archive(&path, archive_type).unwrap();
+                            }
+                        };
+                        if let Some(bar) = bar.as_ref() {
+                            bar.inc(1);
                         }
-                    },
+                    }
                     Err(_) => {
                         debug!("Worker {id} disconnected; shutting down.");
                         break;
@@ -166,6 +183,10 @@ struct Args {
     /// Print format
     #[arg(short, long, default_value = "sum")]
     format: PrintFormat,
+
+    /// Show progress bar
+    #[arg(short, long)]
+    progress: bool,
 
     /// Number of jobs. 0 means number of logical cores.
     #[arg(short, long, default_value = "0")]
@@ -441,12 +462,13 @@ fn process_file(pool: &mut ThreadPool, input: PathBuf, flags: Flags) {
     }
 }
 
-fn process_dir(pool: &mut ThreadPool, input: PathBuf, flags: Flags) -> Result<()> {
+fn process_dir(pool: &mut ThreadPool, input: PathBuf, flags: Flags) -> Result<u64> {
     let walker = if flags.recursive {
         WalkDir::new(input)
     } else {
         WalkDir::new(input).min_depth(1).max_depth(1)
     };
+    let mut file_count = 0;
     for entry in walker
         .into_iter()
         .filter_entry(|e| flags.all || !is_hidden(e))
@@ -454,9 +476,10 @@ fn process_dir(pool: &mut ThreadPool, input: PathBuf, flags: Flags) -> Result<()
         let entry = entry?;
         if entry.file_type().is_file() {
             process_file(pool, entry.into_path(), flags);
+            file_count += 1;
         }
     }
-    Ok(())
+    Ok(file_count)
 }
 
 fn main() -> Result<()> {
@@ -482,23 +505,44 @@ fn main() -> Result<()> {
     };
     debug!("n_jobs: {}", n_jobs);
 
+    let bar = if args.progress {
+        Some(
+            ProgressBar::new(0).with_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}/{duration_precise}] {wide_bar} {pos:>7}/{len:7}",
+                )
+                .unwrap(),
+            ),
+        )
+    } else {
+        None
+    };
+
     let mut pool = ThreadPool::new(
         n_jobs,
         BufHashFactory::new(buffer_size, args.format, args.hash),
+        bar.clone(),
     );
 
     let flags = Flags::from(&args);
 
     // process inputs regardless of all option
+    let mut file_count: u64 = 0;
     for input in args.input {
         if !input.exists() {
             bail!("{}: No such file or directory", input.display());
         }
         if input.is_file() {
             process_file(&mut pool, input, flags);
+            file_count += 1;
         } else if input.is_dir() {
-            process_dir(&mut pool, input, flags)?;
+            file_count += process_dir(&mut pool, input, flags)?;
         };
+    }
+    debug!("file_count: {}", file_count);
+
+    if let Some(bar) = bar {
+        bar.inc_length(file_count);
     }
     Ok(())
 }
