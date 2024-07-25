@@ -1,5 +1,8 @@
 use anyhow::{bail, Result};
-use clap::Parser;
+use clap::{
+    builder::{styling::AnsiColor, Styles},
+    Parser,
+};
 use digest::{generic_array::GenericArray, Digest, FixedOutputReset};
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -152,9 +155,16 @@ enum Algorithm {
     Sha3_384,
     Sha3_512,
 }
+pub fn get_v3_styles() -> clap::builder::Styles {
+    Styles::styled()
+        .header(AnsiColor::Yellow.on_default())
+        .usage(AnsiColor::Yellow.on_default())
+        .literal(AnsiColor::Green.on_default())
+        .placeholder(AnsiColor::Green.on_default())
+}
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None, color=clap::ColorChoice::Auto, styles=get_v3_styles())]
 struct Args {
     /// Input directories or files
     #[arg(required = true)]
